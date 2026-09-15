@@ -3,9 +3,13 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { LabStore, HttpError } from "./lab/store.js";
+import { registerLabRoutes } from "./lab/routes.js";
+import { labPage } from "./lab/page.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "cyanotype-negative-room.json");
+const labDbPath = join(__dirname, "data", "cyanotype-lab.json");
 const port = Number(process.env.PORT || 3040);
 const seed = {
   "items": [
@@ -44,7 +48,10 @@ async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2))
 async function body(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
-  return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
+  if (!chunks.length) return {};
+  const raw = Buffer.concat(chunks).toString("utf8");
+  try { return JSON.parse(raw); }
+  catch { throw new HttpError(400, "invalid_json"); }
 }
 function send(res, status, data) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -90,10 +97,10 @@ function page() {
   </style>
 </head>
 <body>
-  <header><div><h1>古法蓝晒底片整理室</h1><div class="meta">底片任务、工艺步骤、缺陷和入盒交付</div></div><button id="reload">刷新</button></header>
+  <header><div><h1>古法蓝晒底片整理室</h1><div class="meta">底片任务、工艺步骤、缺陷和入盒交付</div></div><div><a href="/lab" style="display:inline-block;background:#32506b;color:#fff;padding:10px 14px;border-radius:6px;text-decoration:none;font-weight:700">配方试验与质量评估台 →</a></div></header>
   <main>
     <section>
-      <form id="createForm"><h2>新增底片</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存底片</button></form>
+      <form id="createForm"><h2>新增底片</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button style="margin-top:12px">保存底片</button></form>
       <form id="actionForm" style="margin-top:14px"><h2>记录工艺步骤</h2><label>选择底片</label><select name="id" id="itemSelect"></select><div id="extraFields"></div><button>提交记录</button></form>
     </section>
     <section>
@@ -142,68 +149,116 @@ function page() {
     async function load() { items = await api('/api/items'); render(); }
     createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
     actionForm.onsubmit = async event => { event.preventDefault(); await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); await load(); };
-    document.querySelector('#statusFilter').onchange = render; document.querySelector('#search').oninput = render; document.querySelector('#reload').onclick = load;
+    document.querySelector('#statusFilter').onchange = render; document.querySelector('#search').oninput = render;
     renderForms(); load();
   </script>
 </body>
 </html>`;
 }
 
-const server = http.createServer(async (req, res) => {
-  try {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const db = await loadDb();
-    if (req.method === "GET" && url.pathname === "/") return html(res, page());
-    if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
-    if (req.method === "POST" && url.pathname === "/api/items") {
-      const input = await body(req);
-      const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建底片" }] };
-      
-      db.items.unshift(item);
-      await saveDb(db);
-      return send(res, 201, item);
+// ---------- 配方试验台路由注册表 ----------
+function createLabRouter(store) {
+  const routes = [];
+  registerLabRoutes((method, re, handler) => routes.push({ method, re, handler }));
+  return async function labRouter(req, res, url, payload) {
+    if (req.method === "GET" && url.pathname === "/lab") { html(res, labPage()); return true; }
+    if (!url.pathname.startsWith("/api/lab/")) return false;
+    const route = routes.find((r) => r.method === req.method && r.re.test(url.pathname));
+    if (!route) throw new HttpError(404, "not_found");
+    const headVal = (name, fallback) => {
+      const raw = req.headers[name];
+      if (raw === undefined) return fallback;
+      try { return decodeURIComponent(raw); } catch { return String(raw).replace(/[^\x20-\x7e]/g, "?"); }
+    };
+    const ctx = {
+      role: headVal("x-lab-role", "viewer"),
+      actor: headVal("x-lab-user", "匿名")
+    };
+    const key = req.headers["idempotency-key"] ? String(req.headers["idempotency-key"]).slice(0, 200) : null;
+    const out = await route.handler({
+      store, body: payload, query: url.searchParams, ctx, key,
+      params: url.pathname.match(route.re).slice(1)
+    });
+    send(res, out.status || 200, out.body !== undefined ? out : { body: out });
+    return true;
+  };
+}
+
+export function createServer(labStore) {
+  const store = labStore || new LabStore(labDbPath);
+  const labRouter = createLabRouter(store);
+
+  const server = http.createServer(async (req, res) => {
+    let payload = {};
+    try {
+      const url = new URL(req.url, `http://${req.headers.host}`);
+      if (req.method !== "GET" && req.method !== "HEAD") payload = await body(req);
+
+      // 配方试验与质量评估台
+      if (await labRouter(req, res, url, payload)) return;
+
+      const db = await loadDb();
+      if (req.method === "GET" && url.pathname === "/") return html(res, page());
+      if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
+      if (req.method === "POST" && url.pathname === "/api/items") {
+        const input = payload;
+        const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建底片" }] };
+
+        db.items.unshift(item);
+        await saveDb(db);
+        return send(res, 201, item);
+      }
+      const patch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
+      if (patch && req.method === "PATCH") {
+        const item = db.items.find(x => x.id === patch[1] || x.code === patch[1]);
+        if (!item) return send(res, 404, { error: "item_not_found" });
+        Object.assign(item, payload);
+        item.logs ||= [];
+        item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
+        await saveDb(db);
+        return send(res, 200, item);
+      }
+      const log = url.pathname.match(/^\/api\/items\/([^/]+)\/logs$/);
+      if (log && req.method === "POST") {
+        const item = db.items.find(x => x.id === log[1] || x.code === log[1]);
+        if (!item) return send(res, 404, { error: "item_not_found" });
+        const input = payload;
+        item.logs ||= [];
+        item.logs.push({ at: new Date().toISOString(), step: input.step || "记录", note: input.note || "" });
+        await saveDb(db);
+        return send(res, 201, item);
+      }
+      const action = url.pathname.match(/^\/api\/items\/([^/]+)\/action$/);
+      if (action && req.method === "POST") {
+        const item = db.items.find(x => x.id === action[1] || x.code === action[1]);
+        if (!item) return send(res, 404, { error: "item_not_found" });
+        const input = payload;
+        item.logs ||= [];
+        item.steps ||= [];
+        item.steps.push({ at: new Date().toISOString(), ...input });
+        if (input.defect) item.defect = input.defect;
+        if (input.step === "冲洗") item.status = "冲洗中";
+        else if (input.step === "入盒") item.status = "待入盒";
+        else if (input.step === "交付") item.status = "已交付";
+        else item.status = "待曝光";
+        item.logs.push({ at: new Date().toISOString(), step: input.step || "工艺", note: input.note || input.developStatus || "步骤记录" });
+        await saveDb(db);
+        return send(res, 201, item);
+      }
+      if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
+      send(res, 404, { error: "not_found" });
+    } catch (error) {
+      if (res.headersSent) return;
+      if (error instanceof HttpError) {
+        return send(res, error.status, { error: error.code, details: error.details });
+      }
+      send(res, 500, { error: error.message });
     }
-    const patch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
-    if (patch && req.method === "PATCH") {
-      const item = db.items.find(x => x.id === patch[1] || x.code === patch[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      Object.assign(item, await body(req));
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
-      await saveDb(db);
-      return send(res, 200, item);
-    }
-    const log = url.pathname.match(/^\/api\/items\/([^/]+)\/logs$/);
-    if (log && req.method === "POST") {
-      const item = db.items.find(x => x.id === log[1] || x.code === log[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      const input = await body(req);
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: input.step || "记录", note: input.note || "" });
-      await saveDb(db);
-      return send(res, 201, item);
-    }
-    const action = url.pathname.match(/^\/api\/items\/([^/]+)\/action$/);
-    if (action && req.method === "POST") {
-      const item = db.items.find(x => x.id === action[1] || x.code === action[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      const input = await body(req);
-      item.logs ||= [];
-      item.steps ||= [];
-      item.steps.push({ at: new Date().toISOString(), ...input });
-      if (input.defect) item.defect = input.defect;
-      if (input.step === "冲洗") item.status = "冲洗中";
-      else if (input.step === "入盒") item.status = "待入盒";
-      else if (input.step === "交付") item.status = "已交付";
-      else item.status = "待曝光";
-      item.logs.push({ at: new Date().toISOString(), step: input.step || "工艺", note: input.note || input.developStatus || "步骤记录" });
-      await saveDb(db);
-      return send(res, 201, item);
-    }
-    if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
-    send(res, 404, { error: "not_found" });
-  } catch (error) {
-    send(res, 500, { error: error.message });
-  }
-});
-server.listen(port, () => console.log("古法蓝晒底片整理室 listening on http://localhost:" + port));
+  });
+  return { server, labStore: store };
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  const { server } = createServer();
+  server.listen(port, () => console.log("古法蓝晒工作室 listening on http://localhost:" + port + " （底片室 /，配方试验台 /lab）"));
+}

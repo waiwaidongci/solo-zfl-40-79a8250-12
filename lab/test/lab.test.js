@@ -199,6 +199,58 @@ describe("stats 纯函数", () => {
     assert.ok(pair, "coating×exposure 2×2 缺格被检出");
     assert.deepEqual(pair.missingCells, [["厚涂", "长曝"]]);
   });
+
+  test("覆盖（区组内）：短洗全在区组1、长洗全在区组2时跨区组虽凑齐，仍判混杂不可定论", () => {
+    // 每个配方：区组1只有短洗、区组2只有长洗（其余三因子在每个区组内两水平齐全）
+    const runs = [];
+    const combos = [0, 1].flatMap((c) => [0, 1].flatMap((e) => [0, 1].map((d) => ({ c, e, d }))));
+    for (const fid of ["FA", "FB"]) {
+      for (const block of [1, 2]) {
+        const wash = block === 1 ? "短洗" : "长洗";
+        for (const x of combos) {
+          runs.push({
+            formulaId: fid, block, status: "reviewed", validReadingId: "r", _score: 1,
+            factors: { coating: LEVELS.coating[x.c], exposure: LEVELS.exposure[x.e], development: LEVELS.development[x.d], wash }
+          });
+        }
+      }
+    }
+    // 跨区组汇总：每个因子两水平都出现、总数均衡——旧逻辑会误放
+    const pooled = new Set(runs.map((r) => r.factors.wash));
+    assert.deepEqual([...pooled].sort(), ["短洗", "长洗"], "跨区组汇总后两水平都在");
+
+    const cov = coverageCheck(runs, FKEYS, LEVELS, ["FA", "FB"], 2);
+    assert.equal(cov.mainEffectsEstimable, false, "水洗水平与区组混杂，主效应不可成立");
+    const washGap = cov.missingMain.filter((m) => m.factor === "wash");
+    assert.equal(washGap.length, 4, "2 配方 × 2 区组各缺一个水洗水平");
+    assert.ok(washGap.some((m) => m.formulaId === "FA" && m.block === 1 && m.missingLevels.includes("长洗")));
+    assert.ok(washGap.some((m) => m.formulaId === "FA" && m.block === 2 && m.missingLevels.includes("短洗")));
+    // 任何与水洗配对的交互单元在区内都缺格
+    assert.equal(cov.interactionsEstimable, false);
+    assert.ok(cov.missingInteractions.some((m) => m.factors.includes("wash") && m.block === 1));
+    // 非水洗因子在区内齐全：coating 不应被报缺失
+    assert.equal(cov.missingMain.some((m) => m.factor === "coating"), false);
+  });
+
+  test("覆盖（区组内）：每个区组都含全部组合才算完整", () => {
+    const runs = [];
+    const combos = [0, 1].flatMap((c) => [0, 1].flatMap((e) => [0, 1].flatMap((d) => [0, 1].map((w) => ({ c, e, d, w })))));
+    for (const fid of ["FA", "FB"]) {
+      for (const block of [1, 2]) {
+        for (const x of combos) {
+          runs.push({
+            formulaId: fid, block, status: "reviewed", validReadingId: "r", _score: 1,
+            factors: { coating: LEVELS.coating[x.c], exposure: LEVELS.exposure[x.e], development: LEVELS.development[x.d], wash: LEVELS.wash[x.w] }
+          });
+        }
+      }
+    }
+    const cov = coverageCheck(runs, FKEYS, LEVELS, ["FA", "FB"], 2);
+    assert.equal(cov.mainEffectsEstimable, true);
+    assert.equal(cov.interactionsEstimable, true);
+    assert.deepEqual(cov.missingMain, []);
+    assert.deepEqual(cov.missingInteractions, []);
+  });
 });
 
 // ---------- HTTP 端到端 ----------
@@ -917,6 +969,84 @@ describe("统计闸门：样本不足 / 区组不平衡不得定论", () => {
       assert.equal(an.gates.interactionsCovered, false, "coating×exposure 缺格");
       assert.equal(an.status, "inconclusive");
       assert.equal(an.winner, null);
+    } finally { await ctx.stop(); await rm(ctx.file, { force: true }); }
+  });
+
+  test("水洗水平与区组混杂（短洗全在区组1、长洗全在区组2）：矩阵均衡仍不得定论", async () => {
+    const ctx = await tempStoreServer();
+    try {
+      const [fa, fb] = await makeTwoFormulas(ctx);
+      const batch = await ctx.req("/api/lab/batches", {
+        method: "POST", role: "technologist",
+        body: minimalBatch([fa.id, fb.id], { blocks: 2, repsPerBlock: 1, minReplicates: 2 })
+      });
+      const bid = batch.json.body.id;
+      const runs = batch.json.body.runs;
+      // 每个区组只验证该区组“指定水洗水平”的试样：区组1 全短洗、区组2 全长洗。
+      // 其余三因子在每个区组内仍覆盖全部 8 个组合，因此区组矩阵 [8,8] 完全均衡。
+      const decisions = [];
+      const pick = runs.filter((r) => r.factors.wash === (r.block === 1 ? "短洗" : "长洗"));
+      for (const r of pick) {
+        const rd = await ctx.req(`/api/lab/batches/${bid}/runs/${r.id}/readings`, {
+          method: "POST", role: "recorder",
+          body: r.formulaId === fa.id
+            ? { density: 1.4, colorDelta: 10, defect: "无" }
+            : { density: 0.9, colorDelta: 28, defect: "白点" }
+        });
+        decisions.push({ runId: r.id, readingId: rd.json.body.reading.id, action: "valid" });
+      }
+      await ctx.req(`/api/lab/batches/${bid}/review`, { method: "POST", role: "reviewer", body: { decisions } });
+
+      const an = (await ctx.req(`/api/lab/batches/${bid}/analysis`)).json.body;
+      assert.equal(an.balance.balanced, true, "每配方每区组各 8 条，区组矩阵均衡");
+      assert.equal(an.balance.enough, true, "每配方 16 条远超最小重复");
+      assert.equal(an.gates.enoughSamples, true);
+      assert.equal(an.gates.blockBalanced, true);
+      assert.equal(an.gates.noMissingCells, true);
+      // 关键：跨区组汇总后水洗两水平都在，但没有任何区组内部两水平齐全
+      assert.equal(an.gates.mainEffectsCovered, false, "水洗与区组混杂，主效应在区内无法成立");
+      assert.equal(an.gates.interactionsCovered, false, "含水洗的交互单元在区内缺格");
+      const washGap = an.coverage.missingMain.filter((m) => m.factor === "wash");
+      assert.ok(washGap.some((m) => m.block === 1 && m.missingLevels.includes("长洗")));
+      assert.ok(washGap.some((m) => m.block === 2 && m.missingLevels.includes("短洗")));
+      assert.equal(an.status, "inconclusive");
+      assert.equal(an.winner, null, "不得给优胜者");
+      assert.equal(an.effects, null, "不得输出主效应值");
+      assert.equal(an.recommendedSetting, null, "不得推荐短洗等工艺水平");
+
+      const close = await ctx.req(`/api/lab/batches/${bid}/close`, { method: "POST", role: "technologist", body: { force: false } });
+      assert.equal(close.status, 409, "区组内覆盖不全拒绝封存定论");
+      const fin = await ctx.req(`/api/lab/formulas/${fa.id}/finalize`, { method: "POST", role: "technologist", body: { batchId: bid } });
+      assert.equal(fin.status, 409, "无结论批次不能用于定版");
+    } finally { await ctx.stop(); await rm(ctx.file, { force: true }); }
+  });
+
+  test("区组内覆盖补全后（每区组都含全部组合）可以定论", async () => {
+    const ctx = await tempStoreServer();
+    try {
+      const [fa, fb] = await makeTwoFormulas(ctx);
+      const batch = await ctx.req("/api/lab/batches", {
+        method: "POST", role: "technologist",
+        body: minimalBatch([fa.id, fb.id], { blocks: 2, repsPerBlock: 1, minReplicates: 2 })
+      });
+      const bid = batch.json.body.id;
+      const decisions = [];
+      for (const r of batch.json.body.runs) {
+        const rd = await ctx.req(`/api/lab/batches/${bid}/runs/${r.id}/readings`, {
+          method: "POST", role: "recorder",
+          body: r.formulaId === fa.id
+            ? { density: 1.4, colorDelta: 10, defect: "无" }
+            : { density: 0.8, colorDelta: 30, defect: "白点" }
+        });
+        decisions.push({ runId: r.id, readingId: rd.json.body.reading.id, action: "valid" });
+      }
+      await ctx.req(`/api/lab/batches/${bid}/review`, { method: "POST", role: "reviewer", body: { decisions } });
+      const an = (await ctx.req(`/api/lab/batches/${bid}/analysis`)).json.body;
+      assert.equal(an.gates.mainEffectsCovered, true);
+      assert.equal(an.gates.interactionsCovered, true);
+      assert.equal(an.status, "conclusive");
+      assert.equal(an.winner.formulaId, fa.id);
+      assert.ok(an.recommendedSetting && an.recommendedSetting.wash);
     } finally { await ctx.stop(); await rm(ctx.file, { force: true }); }
   });
 });

@@ -445,8 +445,8 @@ async function runCompare() {
     gateRow(a.gates.blockBalanced, "区组平衡") +
     gateRow(a.gates.noMissingCells, "无空缺区组格子") +
     gateRow(a.gates.everyFormulaPresent, "每配方有有效数据") +
-    gateRow(a.gates.mainEffectsCovered, "因子水平覆盖完整（主效应可成立）") +
-    gateRow(a.gates.interactionsCovered, "交互单元覆盖完整（二阶交互可成立）") + "</div>";
+    gateRow(a.gates.mainEffectsCovered, "区组内因子水平覆盖完整（主效应可成立）") +
+    gateRow(a.gates.interactionsCovered, "区组内交互单元覆盖完整（二阶交互可成立）") + "</div>";
   if (a.status !== "conclusive") {
     html += '<p class="gate-bad">结论：样本不足、区组不平衡或因子/交互覆盖不完整，不得定论。原因：' + esc(a.reasons.join("；")) + "</p>";
   } else {

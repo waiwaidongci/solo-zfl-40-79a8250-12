@@ -149,19 +149,31 @@ export function balanceCheck(validRuns, blocks, minReplicates) {
   };
 }
 
-// 覆盖度：主效应要求“每个配方 × 每个因子”的全部设计水平都有有效观测；
-// 二阶交互要求“每个配方 × 每对因子”的全部 2×2（或 l1×l2）单元都有有效观测。
-// 任一缺失，对应效应在统计上无法成立，不得据此给结论/建议水平。
-export function coverageCheck(validRuns, factorKeys, levels, formulas) {
+// 覆盖度（RCBD：随机化与外推都在区组内成立，效应必须在“每个配方 × 每个区组”内可估）：
+//   主效应——每个配方在每个区组中，每个因子的全部设计水平都至少有一条有效观测；
+//   二阶交互——每个配方在每个区组中，每对因子的全部 l1×l2 单元都有有效观测。
+// 只在跨区组汇总后才“凑齐”某水平/单元（如短洗全在区组1、长洗全在区组2）属于因子与区组
+// 混杂，判为覆盖不完整，不得据此给结论、效应值或建议水平。
+export function coverageCheck(validRuns, factorKeys, levels, formulas, blocks) {
+  const blockNums = [];
+  for (let b = 1; b <= blocks; b++) blockNums.push(b);
+  // 若调用方未给区组数，按数据中实际出现的区组兜底（单元测试直调时使用）
+  if (!blockNums.length) {
+    for (const r of validRuns) if (!blockNums.includes(r.block)) blockNums.push(r.block);
+  }
+
   const missingMain = [];
   for (const fid of formulas) {
-    const rows = validRuns.filter((r) => r.formulaId === fid);
-    for (const key of factorKeys) {
-      const present = new Set(rows.map((r) => r.factors[key]));
-      const missing = (levels[key] || []).filter((lvl) => !present.has(lvl));
-      if (missing.length) missingMain.push({ formulaId: fid, factor: key, missingLevels: missing });
+    for (const block of blockNums) {
+      const rows = validRuns.filter((r) => r.formulaId === fid && r.block === block);
+      for (const key of factorKeys) {
+        const present = new Set(rows.map((r) => r.factors[key]));
+        const missingLevels = (levels[key] || []).filter((lvl) => !present.has(lvl));
+        if (missingLevels.length) missingMain.push({ formulaId: fid, block, factor: key, missingLevels });
+      }
     }
   }
+
   const pairs = [];
   const missingInteractions = [];
   for (let i = 0; i < factorKeys.length; i++) {
@@ -169,16 +181,18 @@ export function coverageCheck(validRuns, factorKeys, levels, formulas) {
       const a = factorKeys[i], b = factorKeys[j];
       pairs.push([a, b]);
       for (const fid of formulas) {
-        const rows = validRuns.filter((r) => r.formulaId === fid);
-        const cells = new Set(rows.map((r) => `${r.factors[a]}␟${r.factors[b]}`));
-        const missingCells = [];
-        for (const la of levels[a] || []) {
-          for (const lb of levels[b] || []) {
-            if (!cells.has(`${la}␟${lb}`)) missingCells.push([la, lb]);
+        for (const block of blockNums) {
+          const rows = validRuns.filter((r) => r.formulaId === fid && r.block === block);
+          const cells = new Set(rows.map((r) => `${r.factors[a]}␟${r.factors[b]}`));
+          const missingCells = [];
+          for (const la of levels[a] || []) {
+            for (const lb of levels[b] || []) {
+              if (!cells.has(`${la}␟${lb}`)) missingCells.push([la, lb]);
+            }
           }
-        }
-        if (missingCells.length) {
-          missingInteractions.push({ formulaId: fid, factors: [a, b], missingCells });
+          if (missingCells.length) {
+            missingInteractions.push({ formulaId: fid, block, factors: [a, b], missingCells });
+          }
         }
       }
     }
@@ -198,8 +212,8 @@ export function analyzeBatch(batch) {
   });
 
   const balance = balanceCheck(valid, batch.blocks, batch.minReplicates);
-  // 因子水平 / 交互单元覆盖：只统计“设计中存在”的水平与组合
-  const coverage = coverageCheck(valid, factorKeys, batch.levels, batch.formulaIds);
+  // 因子水平 / 交互单元覆盖：在“每个配方 × 每个区组”内核对，防止水平与区组混杂
+  const coverage = coverageCheck(valid, factorKeys, batch.levels, batch.formulaIds, batch.blocks);
   const pendingCount = activeRunsOf(batch).filter((r) => r.status !== "reviewed").length;
   const exclusions = batch.runs.filter((r) => r.status === "excluded").length;
 
@@ -282,8 +296,8 @@ export function analyzeBatch(batch) {
       !gates.blockBalanced && "区组不平衡：同一配方在各区组的有效试样数不等，或配方间区组分布不一致",
       !gates.noMissingCells && "存在空缺的配方×区组格子",
       !gates.everyFormulaPresent && "有配方尚无任何有效试样",
-      !gates.mainEffectsCovered && "因子水平覆盖不完整：部分配方缺少某因子的设计水平，主效应无法成立",
-      !gates.interactionsCovered && "交互单元覆盖不完整：部分配方缺少因子对的 2×2 单元，交互无法成立"
+      !gates.mainEffectsCovered && "区组内因子水平覆盖不完整：某配方在某区组缺少某因子的设计水平，水平与区组混杂，主效应无法成立",
+      !gates.interactionsCovered && "区组内交互单元覆盖不完整：某配方在某区组缺少因子对的交互单元，交互无法成立"
     ].filter(Boolean),
     balance,
     coverage,

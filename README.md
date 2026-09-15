@@ -9,7 +9,7 @@
 
 ```bash
 npm start        # http://localhost:3040
-npm test         # node --test，配方试验台 20+ 项端到端/单元测试
+npm test         # node --test lab/test/lab.test.js（20+ 项端到端/单元测试）
 ```
 
 数据：

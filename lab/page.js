@@ -422,7 +422,7 @@ async function runCompare() {
   const box = $("#compareResult");
   if (!id) { box.innerHTML = '<span class="meta">尚无批次</span>'; return; }
   const a = await api("/api/lab/batches/" + id + "/analysis");
-  const gateRow = (ok, label) => "<span class='" + (ok ? "gate-ok\">✔ " : "gate-bad\">✘ ") + label + "</span>　";
+  const gateRow = (ok, label) => '<span class="' + (ok ? 'gate-ok">✔ ' : 'gate-bad">✘ ') + label + '</span>　';
   let html = '<div class="row">' +
     gateRow(a.gates.enoughSamples, "样本量达标（每配方 ≥ 最小重复）") +
     gateRow(a.gates.blockBalanced, "区组平衡") +

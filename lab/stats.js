@@ -119,18 +119,34 @@ export function balanceCheck(validRuns, blocks, minReplicates) {
   }
   const counts = formulas.map((fid) => matrix[fid].reduce((s, v) => s + v, 0));
   const enough = counts.every((n) => n >= minReplicates);
-  const ref = matrix[formulas[0]] || [];
-  let balanced = counts.length > 0 && counts.every((c) => c === counts[0]);
   const missing = [];
-  if (balanced) {
+  // 严格区组平衡，两条都必须成立：
+  //  1) 配方内：同一配方在每个区组的有效试样数相等（区组等重复）——
+  //     只比配方之间的总数无法发现 [3,1] 与 [2,2] 这类区内失衡；
+  //  2) 配方间：每个区组各配方的有效试样数一致（区组×配方格子对齐）。
+  let withinFormulaUniform = counts.length > 0;
+  for (const fid of formulas) {
+    const first = matrix[fid][0];
+    for (let b = 0; b < blocks; b++) {
+      if (matrix[fid][b] === 0) missing.push({ formulaId: fid, block: b + 1 });
+      if (b > 0 && matrix[fid][b] !== first) withinFormulaUniform = false;
+    }
+  }
+  const ref = matrix[formulas[0]] || [];
+  let crossFormulaUniform = counts.length > 0 && counts.every((c) => c === counts[0]);
+  if (crossFormulaUniform) {
     for (const fid of formulas) {
       for (let b = 0; b < blocks; b++) {
-        if (matrix[fid][b] !== ref[b]) balanced = false;
-        if (matrix[fid][b] === 0) missing.push({ formulaId: fid, block: b + 1 });
+        if (matrix[fid][b] !== ref[b]) { crossFormulaUniform = false; }
       }
     }
   }
-  return { matrix, counts: Object.fromEntries(formulas.map((f, i) => [f, counts[i]])), enough, balanced, missing };
+  const balanced = withinFormulaUniform && crossFormulaUniform;
+  return {
+    matrix,
+    counts: Object.fromEntries(formulas.map((f, i) => [f, counts[i]])),
+    enough, balanced, withinFormulaUniform, crossFormulaUniform, missing
+  };
 }
 
 export function analyzeBatch(batch) {
@@ -141,7 +157,7 @@ export function analyzeBatch(batch) {
   });
 
   const balance = balanceCheck(valid, batch.blocks, batch.minReplicates);
-  const pendingCount = activeRunsOf(batch).filter((r) => r.status !== "valid").length;
+  const pendingCount = activeRunsOf(batch).filter((r) => r.status !== "reviewed").length;
   const exclusions = batch.runs.filter((r) => r.status === "excluded").length;
 
   const groups = {};

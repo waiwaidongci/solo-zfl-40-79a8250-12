@@ -8,8 +8,7 @@ import { rm } from "node:fs/promises";
 import { createServer } from "../../server.js";
 import { LabStore } from "../store.js";
 import { makeRng, hashSeed, validateFactors, designRuns } from "../design.js";
-import { summarize, qualityScore, analyzeBatch } from "../stats.js";
-
+import { summarize, qualityScore, analyzeBatch, balanceCheck } from "../stats.js";
 async function startServer(store) {
   const { server } = createServer(store);
   server.listen(0, "127.0.0.1");
@@ -122,6 +121,35 @@ describe("stats 纯函数", () => {
     assert.equal(result.status, "inconclusive");
     assert.equal(result.winner, null);
     assert.ok(result.reasons.length >= 1);
+  });
+
+  const mkRun = (formulaId, block) => ({ formulaId, block, status: "reviewed", validReadingId: "r", _score: 1 });
+
+  test("区组矩阵：配方间一致但配方内区组不等（[2,1,1]）判为不平衡", () => {
+    const runs = [];
+    for (const fid of ["FA", "FB"]) {
+      runs.push(mkRun(fid, 1), mkRun(fid, 1), mkRun(fid, 2), mkRun(fid, 3));
+    }
+    const b = balanceCheck(runs, 3, 2);
+    assert.equal(b.enough, true, "总数达标：每配方 4 ≥ 2");
+    assert.equal(b.withinFormulaUniform, false, "配方内各区组 2/1/1 不等");
+    assert.equal(b.crossFormulaUniform, true, "两配方区组向量完全一致——旧逻辑会误放");
+    assert.equal(b.balanced, false);
+  });
+
+  test("区组矩阵：每配方各区组等重复才算平衡", () => {
+    const balanced = [];
+    for (const fid of ["FA", "FB"]) for (const block of [1, 2, 3]) balanced.push(mkRun(fid, block));
+    const ok = balanceCheck(balanced, 3, 2);
+    assert.equal(ok.withinFormulaUniform, true);
+    assert.equal(ok.crossFormulaUniform, true);
+    assert.equal(ok.balanced, true);
+
+    // 配方间不一致同样不平衡
+    const cross = [...balanced, mkRun("FA", 1)];
+    const bad = balanceCheck(cross, 3, 2);
+    assert.equal(bad.crossFormulaUniform, false);
+    assert.equal(bad.balanced, false);
   });
 });
 
@@ -397,6 +425,67 @@ describe("并发 / 幂等 / 乱序 / 落盘失败", () => {
     } finally { await ctx.stop(); await rm(ctx.file, { force: true }); }
   });
 
+  test("幂等键按提交人隔离：同键不同提交人各自生效，不回放他人响应", async () => {
+    const ctx = await tempStoreServer();
+    try {
+      const [fa, fb] = await makeTwoFormulas(ctx);
+      const batch = await ctx.req("/api/lab/batches", { method: "POST", role: "technologist", body: minimalBatch([fa.id, fb.id]) });
+      const run = batch.json.body.runs[0];
+      const bid = batch.json.body.id;
+      const path = `/api/lab/batches/${bid}/runs/${run.id}/readings`;
+      const payload = { density: 1.2, colorDelta: 6, defect: "无" };
+      // 同一键、同一接口、不同提交人 -> 两条独立读数
+      const a = await ctx.req(path, { method: "POST", role: "recorder", user: "记录员甲", key: "shared-K", body: payload });
+      const b = await ctx.req(path, { method: "POST", role: "recorder", user: "记录员乙", key: "shared-K", body: payload });
+      assert.equal(a.status, 201);
+      assert.equal(b.status, 201, "不同提交人复用同键不得回放他人响应");
+      assert.notEqual(b.json.replayed, true);
+      assert.notEqual(a.json.body.reading.id, b.json.body.reading.id);
+      const full = await ctx.req(`/api/lab/batches/${bid}`);
+      const r0 = full.json.body.runs.find((x) => x.id === run.id);
+      assert.equal(r0.readings.length, 2);
+      // 同一提交人重发同键 -> 回放本人的首次响应
+      const again = await ctx.req(path, { method: "POST", role: "recorder", user: "记录员甲", key: "shared-K", body: payload });
+      assert.equal(again.status, 201);
+      assert.equal(again.json.replayed, true);
+      assert.equal(again.json.body.reading.id, a.json.body.reading.id);
+    } finally { await ctx.stop(); await rm(ctx.file, { force: true }); }
+  });
+
+  test("幂等键按请求隔离：同键用于不同接口不会回放旧响应", async () => {
+    const ctx = await tempStoreServer();
+    try {
+      const [fa, fb] = await makeTwoFormulas(ctx);
+      const batch = await ctx.req("/api/lab/batches", {
+        method: "POST", role: "technologist", key: "cross-endpoint-K",
+        body: minimalBatch([fa.id, fb.id])
+      });
+      assert.equal(batch.status, 201);
+      const bid = batch.json.body.id;
+      const runId = batch.json.body.runs[0].id;
+      // 同一个键打到“录入读数”这个不同接口：必须真实执行，不能回放批次创建响应
+      const reading = await ctx.req(`/api/lab/batches/${bid}/runs/${runId}/readings`, {
+        method: "POST", role: "recorder", key: "cross-endpoint-K",
+        body: { density: 1.2, colorDelta: 6, defect: "无" }
+      });
+      assert.equal(reading.status, 201, "不同接口同键不得回放旧接口响应");
+      assert.notEqual(reading.json.replayed, true);
+      assert.ok(reading.json.body.reading.id);
+      const full = await ctx.req(`/api/lab/batches/${bid}`);
+      assert.equal(full.json.body.runs.find((r) => r.id === runId).readings.length, 1);
+      // 同接口同键再发（合法但数值不同的重试体）-> 回放的是首次响应，不产生第二条读数
+      const replay = await ctx.req(`/api/lab/batches/${bid}/runs/${runId}/readings`, {
+        method: "POST", role: "recorder", key: "cross-endpoint-K",
+        body: { density: 0.9, colorDelta: 5, defect: "无" }
+      });
+      assert.equal(replay.json.replayed, true);
+      assert.equal(replay.json.body.reading.id, reading.json.body.reading.id);
+      assert.equal(replay.json.body.reading.density, 1.2, "回放的是首次测量值而非重试体");
+      const afterReplay = await ctx.req(`/api/lab/batches/${bid}`);
+      assert.equal(afterReplay.json.body.runs.find((r) => r.id === runId).readings.length, 1);
+    } finally { await ctx.stop(); await rm(ctx.file, { force: true }); }
+  });
+
   test("乱序提交不影响设计顺序与统计", async () => {
     const ctx = await tempStoreServer();
     try {
@@ -442,6 +531,65 @@ describe("并发 / 幂等 / 乱序 / 落盘失败", () => {
       list = await ctx.req("/api/lab/formulas");
       assert.equal(list.json.body.length, 1);
     } finally { await ctx.stop(); }
+  });
+
+  test("落盘进行中读取被阻塞：提交完成前看不到未提交记录", async () => {
+    let releaseWrite;
+    const gate = new Promise((r) => { releaseWrite = r; });
+    let blockNext = true;
+    const store = new LabStore(null, {
+      persist: async () => { if (blockNext) await gate; }
+    });
+    const ctx = await startServer(store);
+    try {
+      const writeP = ctx.req("/api/lab/formulas", {
+        method: "POST", role: "technologist",
+        body: { code: "HANG", name: "未落盘配方", ferricAmmoniumCitrate: "a", potassiumFerricyanide: "b", ratio: "1:1" }
+      });
+      await new Promise((r) => setTimeout(r, 60)); // 确保写事务已进入落盘阶段
+      const readP = ctx.req("/api/lab/formulas");
+      let readDone = false;
+      readP.then(() => { readDone = true; });
+      await new Promise((r) => setTimeout(r, 60));
+      assert.equal(readDone, false, "读取在落盘完成前必须排队等待");
+
+      blockNext = false;
+      releaseWrite(); // 放行使落盘完成、事务提交
+      const [writeRes, readRes] = await Promise.all([writeP, readP]);
+      assert.equal(writeRes.status, 201);
+      // 读取排在写事务之后，看到的是提交后的状态（含该记录），绝不会读到中间态
+      assert.equal(readRes.json.body.length, 1);
+      assert.equal(readRes.json.body[0].code, "HANG");
+    } finally { releaseWrite && releaseWrite(); await ctx.stop(); }
+  });
+
+  test("落盘失败：等待中的读取在回滚完成后才执行，看不到随后回滚的记录", async () => {
+    let releaseWrite;
+    const gate = new Promise((r) => { releaseWrite = r; });
+    let shouldBlock = true;
+    const store = new LabStore(null, {
+      persist: async () => { if (shouldBlock) { await gate; throw new Error("磁盘掉线"); } }
+    });
+    const ctx = await startServer(store);
+    try {
+      const writeP = ctx.req("/api/lab/formulas", {
+        method: "POST", role: "technologist",
+        body: { code: "GHOST", name: "将回滚配方", ferricAmmoniumCitrate: "a", potassiumFerricyanide: "b", ratio: "1:1" }
+      });
+      await new Promise((r) => setTimeout(r, 60));
+      const readP = ctx.req("/api/lab/formulas"); // 落盘挂起期间发起的读取
+      let readDone = false;
+      readP.then(() => { readDone = true; });
+      await new Promise((r) => setTimeout(r, 60));
+      assert.equal(readDone, false, "回滚完成前读取保持阻塞");
+
+      shouldBlock = false;
+      releaseWrite(); // 落盘抛错 -> 内存回滚
+      const [writeRes, readRes] = await Promise.all([writeP, readP]);
+      assert.equal(writeRes.status, 500);
+      assert.equal(writeRes.json.error, "persist_failed");
+      assert.equal(readRes.json.body.length, 0, "未提交/已回滚记录对读取不可见");
+    } finally { releaseWrite && releaseWrite(); await ctx.stop(); }
   });
 });
 
@@ -494,6 +642,43 @@ describe("统计闸门：样本不足 / 区组不平衡不得定论", () => {
       const a = await ctx.req(`/api/lab/batches/${bid}/analysis`);
       assert.equal(a.json.body.gates.blockBalanced, false);
       assert.equal(a.json.body.status, "inconclusive");
+    } finally { await ctx.stop(); await rm(ctx.file, { force: true }); }
+  });
+
+  test("配方内区组不等（两配方同样 [2,1,1]）仍不得定论", async () => {
+    const ctx = await tempStoreServer();
+    try {
+      const [fa, fb] = await makeTwoFormulas(ctx);
+      const batch = await ctx.req("/api/lab/batches", {
+        method: "POST", role: "technologist",
+        body: minimalBatch([fa.id, fb.id], { blocks: 3, repsPerBlock: 1, minReplicates: 2 })
+      });
+      const bid = batch.json.body.id;
+      const runs = batch.json.body.runs;
+      // 每个配方在区组1取2个、区组2取1个、区组3取1个 -> 配方内 2/1/1 不等，
+      // 但两配方分布完全相同，只比较配方之间的旧逻辑会误判为平衡。
+      const want = [[fa.id, 1, 2], [fa.id, 2, 1], [fa.id, 3, 1], [fb.id, 1, 2], [fb.id, 2, 1], [fb.id, 3, 1]];
+      const decisions = [];
+      for (const [fid, block, n] of want) {
+        const inBlock = runs.filter((r) => r.formulaId === fid && r.block === block).slice(0, n);
+        for (const r of inBlock) {
+          const rd = await ctx.req(`/api/lab/batches/${bid}/runs/${r.id}/readings`, {
+            method: "POST", role: "recorder", body: { density: 1.2, colorDelta: 8, defect: "无" }
+          });
+          decisions.push({ runId: r.id, readingId: rd.json.body.reading.id, action: "valid" });
+        }
+      }
+      await ctx.req(`/api/lab/batches/${bid}/review`, { method: "POST", role: "reviewer", body: { decisions } });
+      const a = await ctx.req(`/api/lab/batches/${bid}/analysis`);
+      assert.equal(a.json.body.balance.withinFormulaUniform, false);
+      assert.equal(a.json.body.balance.crossFormulaUniform, true, "两配方分布一致");
+      assert.equal(a.json.body.gates.enoughSamples, true, "样本总数本身达标");
+      assert.equal(a.json.body.gates.blockBalanced, false);
+      assert.equal(a.json.body.status, "inconclusive");
+      assert.equal(a.json.body.winner, null);
+
+      const close = await ctx.req(`/api/lab/batches/${bid}/close`, { method: "POST", role: "technologist", body: { force: false } });
+      assert.equal(close.status, 409, "区组不等必须拒绝封存定论");
     } finally { await ctx.stop(); await rm(ctx.file, { force: true }); }
   });
 });

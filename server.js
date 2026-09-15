@@ -174,7 +174,12 @@ function createLabRouter(store) {
       role: headVal("x-lab-role", "viewer"),
       actor: headVal("x-lab-user", "匿名")
     };
-    const key = req.headers["idempotency-key"] ? String(req.headers["idempotency-key"]).slice(0, 200) : null;
+    // 幂等键按“提交人 + 请求方法 + 路径 + 客户端键”隔离：
+    // 同一键被不同提交人复用、或在不同接口上复用，都不会回放旧响应。
+    const rawKey = req.headers["idempotency-key"];
+    const key = rawKey
+      ? `${req.method} ${url.pathname}｜${ctx.actor}｜${String(rawKey).slice(0, 200)}`
+      : null;
     const out = await route.handler({
       store, body: payload, query: url.searchParams, ctx, key,
       params: url.pathname.match(route.re).slice(1)

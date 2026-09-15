@@ -54,15 +54,16 @@ export class LabStore {
     }
   }
 
-  async getState() {
-    await this.init();
-    return this._db;
-  }
-
-  // 只读快照（深拷贝），供分析/列表使用
-  async read() {
-    await this.init();
-    return structuredClone(this._db);
+  // 只读快照（深拷贝）。读取被排进单写队列尾部：
+  // 只有排在前面的事务（含落盘）完成后才执行，调用方永远看不到“随后会被回滚”的
+  // 未提交记录——包括落盘进行中的窗口。
+  read() {
+    const run = this._chain.then(async () => {
+      await this.init();
+      return structuredClone(this._db);
+    });
+    this._chain = run.then(() => {}, () => {});
+    return run;
   }
 
   nextId(prefix) {

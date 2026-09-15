@@ -62,6 +62,21 @@ function html(res, text) {
   res.end(text);
 }
 function newId() { return "CN-" + Date.now(); }
+
+// 请求内容指纹：键排序的规范化 JSON 再做 FNV-1a，同内容（无论键序）同指纹。
+function canonicalFingerprint(value) {
+  const canon = (v) => {
+    if (Array.isArray(v)) return "[" + v.map(canon).join(",") + "]";
+    if (v && typeof v === "object") {
+      return "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + canon(v[k])).join(",") + "}";
+    }
+    return JSON.stringify(v);
+  };
+  let h = 2166136261;
+  const s = canon(value);
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return (h >>> 0).toString(16);
+}
 function computeStats(items) {
   const stats = Object.fromEntries(statLabels.map(label => [label, 0]));
   for (const item of items) {
@@ -182,6 +197,7 @@ function createLabRouter(store) {
       : null;
     const out = await route.handler({
       store, body: payload, query: url.searchParams, ctx, key,
+      fingerprint: canonicalFingerprint(payload),
       params: url.pathname.match(route.re).slice(1)
     });
     send(res, out.status || 200, out.body !== undefined ? out : { body: out });

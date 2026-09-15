@@ -367,8 +367,8 @@ async function renderReview() {
   const b = await api("/api/lab/batches/" + id);
   const factorName = (k) => (STATE.factors.find((f) => f.key === k) || {}).name || k;
   const fCode = (fid) => (STATE.formulas.find((x) => x.id === fid) || {}).code || fid;
-  const groups = b.runs.filter((r) => r.status === "entered");
-  $("#reviewList").innerHTML = groups.length ? groups.map((r) =>
+  const reviewed = b.runs.filter((r) => r.status === "reviewed");
+  $("#reviewList").innerHTML = (groups.length ? groups.map((r) =>
     '<div class="card"><h3>' + r.id + " · 区组 " + r.block + " · 顺序#" + r.order + " · " + esc(fCode(r.formulaId)) +
     ' <span class="pill draft">待复核</span></h3><div class="meta small">' +
     Object.entries(r.factors).map(([k, v]) => factorName(k) + ":" + esc(v)).join(" / ") +
@@ -381,9 +381,26 @@ async function renderReview() {
       "<button class='act gray small' data-reject='" + r.id + "|" + rd.id + "'>驳回该读数</button></td></tr>").join("") +
     "</table><div class='row'><input class='ex-reason' placeholder='排除原因（必填，留痕），如 涂布划伤'>" +
     "<button class='act danger small' data-exclude='" + r.id + "'>整样异常排除（自动补同区组替补）</button></div></div>").join("")
-    : '<span class="meta">没有待复核试样（录入后在此裁决）。已复核试样可在比较页查看。</span>';
+    : '<span class="meta">没有待复核试样。</span>') +
+    (reviewed.length ? "<h3 style='margin-top:18px'>已复核（改选读数需先退回重裁，强制填写原因并留痕）</h3>" +
+      reviewed.map((r) => {
+        const valid = r.readings.find((rd) => rd.id === r.validReadingId);
+        return '<div class="card"><h3>' + r.id + " · " + esc(fCode(r.formulaId)) + ' <span class="pill final">有效</span></h3>' +
+          "<div class='small'>当前有效读数 <b class='mono'>" + esc(valid ? valid.id : "—") + "</b>　D=" + (valid ? valid.density : "—") +
+          " ΔE=" + (valid ? valid.colorDelta : "—") + " " + esc(valid ? valid.defect : "") + "</div>" +
+          "<div class='row'><button class='act gray small' data-reopen='" + r.id + "'>退回重裁（改选读数）</button></div></div>";
+      }).join("") : "");
 
   const postReview = async (decisions) => api("/api/lab/batches/" + id + "/review", { method: "POST", body: JSON.stringify({ decisions }) });
+  $$("[data-reopen]").forEach((btn) => btn.onclick = async () => {
+    const runId = btn.dataset.reopen;
+    const reason = prompt("退回重裁原因（至少 2 字，留痕后可重新选择有效读数）");
+    if (!reason || reason.trim().length < 2) return toast("退回必须写明原因", true);
+    try {
+      await api("/api/lab/batches/" + id + "/runs/" + runId + "/reopen", { method: "POST", body: JSON.stringify({ reason }) });
+      toast("已退回重裁，原有效值与重复读数均回到待裁决"); refresh();
+    } catch (e) { toast(e.message, true); }
+  });
   $$("[data-valid]").forEach((btn) => btn.onclick = async () => {
     const [runId, readingId] = btn.dataset.valid.split("|");
     const reason = prompt("复核说明（可空）：", "重复测量中密度与色差一致性最好") || "";
@@ -426,13 +443,15 @@ async function runCompare() {
   let html = '<div class="row">' +
     gateRow(a.gates.enoughSamples, "样本量达标（每配方 ≥ 最小重复）") +
     gateRow(a.gates.blockBalanced, "区组平衡") +
-    gateRow(a.gates.noMissingCells, "无空缺格子") +
-    gateRow(a.gates.everyFormulaPresent, "每配方有有效数据") + "</div>";
+    gateRow(a.gates.noMissingCells, "无空缺区组格子") +
+    gateRow(a.gates.everyFormulaPresent, "每配方有有效数据") +
+    gateRow(a.gates.mainEffectsCovered, "因子水平覆盖完整（主效应可成立）") +
+    gateRow(a.gates.interactionsCovered, "交互单元覆盖完整（二阶交互可成立）") + "</div>";
   if (a.status !== "conclusive") {
-    html += '<p class="gate-bad">结论：样本不足或区组不平衡，不得定论。原因：' + esc(a.reasons.join("；")) + "</p>";
+    html += '<p class="gate-bad">结论：样本不足、区组不平衡或因子/交互覆盖不完整，不得定论。原因：' + esc(a.reasons.join("；")) + "</p>";
   } else {
     html += '<p class="gate-ok">结论：可以定论。优胜：' + esc(fName(a.winner.formulaId)) + "（均分 " + a.winner.mean + "，n=" + a.winner.n + "，95%CI ±" + a.winner.ci + "）</p>";
-    if (a.ciOverlap.some((x) => x.overlap)) html += '<p><span class="pill bad">置信区间与次优重叠：' +
+    if (Array.isArray(a.ciOverlap) && a.ciOverlap.some((x) => x.overlap)) html += '<p><span class="pill bad">置信区间与次优重叠：' +
       a.ciOverlap.filter((x) => x.overlap).map((x) => esc(fName(x.formulaId)) + "（差 " + x.gap + "）").join("、") + "，建议增加重复</span></p>";
   }
   html += "<h3>配方组统计（质量分 / 密度 / 色差）</h3><table><tr><th>配方</th><th>n</th><th>均值</th><th>极差</th><th>95%CI</th><th>密度均值</th><th>ΔE均值</th><th>缺陷率</th></tr>" +
@@ -441,16 +460,23 @@ async function runCompare() {
       "<td>[" + g.score.lo + ", " + g.score.hi + "]</td><td>" + g.density.mean + "</td><td>" + g.colorDelta.mean + "</td><td>" +
       (g.defectRate === null ? "—" : Math.round(g.defectRate * 100) + "%") + "</td></tr>"; }).join("") + "</table>";
   const fn = (k) => (STATE.factors.find((f) => f.key === k) || { name: k }).name;
-  html += "<h3>主效应（按质量分，正值为该因子最佳/最差水平差）</h3><table><tr><th>因子</th>" +
-    Object.keys(a.effects).map((k) => "<th>" + fn(k) + "</th>").join("") + "</tr><tr><td>各水平均值</td>" +
-    Object.values(a.effects).map((e) => "<td class='small'>" + Object.entries(e.means).map(([l, v]) => esc(l) + "=" + v).join("，") + "</td>").join("") +
-    "</tr><tr><td>效应幅度</td>" + Object.values(a.effects).map((e) => "<td>" + e.effect + "</td>").join("") +
-    "</tr><tr><td>建议水平</td>" + Object.values(a.effects).map((e) => "<td><b>" + esc(e.bestLevel || "—") + "</b></td>").join("") + "</tr></table>";
-  html += "<h3>二阶交互（DID 差之差）</h3><table><tr><th>因子对</th><th>DID</th><th>提示</th></tr>" +
-    (a.interactions.length ? a.interactions.map((ix) => "<tr><td>" + ix.factors.map(fn).join(" × ") + "</td><td>" + ix.did +
-      "</td><td>" + (a.strongInteractions.includes(ix.factors.join("×")) ? "<span class='pill bad'>交互较强：需按组合选择，不能只看主效应</span>" : "弱") + "</td></tr>").join("")
-      : "<tr><td colspan=3>数据不足以估计交互</td></tr>") + "</table>";
-  if (a.status === "conclusive") html += '<p class="meta small">建议工艺组合：' +
+  if (a.effects) {
+    html += "<h3>主效应（按质量分，正值为该因子最佳/最差水平差）</h3><table><tr><th>因子</th>" +
+      Object.keys(a.effects).map((k) => "<th>" + fn(k) + "</th>").join("") + "</tr><tr><td>各水平均值</td>" +
+      Object.values(a.effects).map((e) => "<td class='small'>" + Object.entries(e.means).map(([l, v]) => esc(l) + "=" + v).join("，") + "</td>").join("") +
+      "</tr><tr><td>效应幅度</td>" + Object.values(a.effects).map((e) => "<td>" + e.effect + "</td>").join("") +
+      "</tr><tr><td>建议水平</td>" + Object.values(a.effects).map((e) => "<td><b>" + esc(e.bestLevel || "—") + "</b></td>").join("") + "</tr></table>";
+  } else {
+    html += '<h3>主效应</h3><p class="gate-bad">因子水平覆盖不完整，主效应无法成立，不输出效应值与建议水平。</p>';
+  }
+  if (a.gates.interactionsCovered && a.interactions.length) {
+    html += "<h3>二阶交互（DID 差之差）</h3><table><tr><th>因子对</th><th>DID</th><th>提示</th></tr>" +
+      a.interactions.map((ix) => "<tr><td>" + ix.factors.map(fn).join(" × ") + "</td><td>" + ix.did +
+        "</td><td>" + (a.strongInteractions.includes(ix.factors.join("×")) ? "<span class='pill bad'>交互较强：需按组合选择，不能只看主效应</span>" : "弱") + "</td></tr>").join("") + "</table>";
+  } else {
+    html += "<h3>二阶交互（DID 差之差）</h3><p class='gate-bad'>交互单元覆盖不完整，交互无法成立，不输出 DID。</p>";
+  }
+  if (a.status === "conclusive" && a.recommendedSetting) html += '<p class="meta small">建议工艺组合：' +
     Object.entries(a.recommendedSetting).map(([k, v]) => fn(k) + "=" + esc(v)).join("，") + "</p>";
   html += '<p class="meta small">有效试样 ' + a.validCount + " / 在册 " + a.runCount + "，已排除 " + a.exclusions + "，未完成 " + a.pendingCount + "</p>";
   box.innerHTML = html;

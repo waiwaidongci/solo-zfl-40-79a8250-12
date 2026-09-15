@@ -95,7 +95,7 @@ export function registerLabRoutes(on) {
     return { status: 200, body: db.formulas.map(publicFormula) };
   });
 
-  on("POST", /^\/api\/lab\/formulas$/, async ({ store, body, ctx, key }) => {
+  on("POST", /^\/api\/lab\/formulas$/, async ({ store, body, ctx, key, fingerprint }) => {
     assertPerm(ctx.role, "POST /formulas");
     const name = str(body.name, "name", { max: 60 });
     const ferric = str(body.ferricAmmoniumCitrate, "ferricAmmoniumCitrate", { max: 40 });
@@ -116,7 +116,7 @@ export function registerLabRoutes(on) {
       db.formulas.push(f);
       addAudit(db, { at: now(), actor: ctx.actor, role: ctx.role, action: "formula_create", target: f.id, detail: { code: f.code, name } });
       return { status: 201, body: publicFormula(f) };
-    }, { idemKey: key });
+    }, { idemKey: key, idemFingerprint: fingerprint });
   });
 
   on("GET", /^\/api\/lab\/formulas\/([^/]+)$/, async ({ store, params }) => {
@@ -126,7 +126,7 @@ export function registerLabRoutes(on) {
     return { status: 200, body: f };
   });
 
-  on("POST", /^\/api\/lab\/formulas\/([^/]+)\/revise$/, async ({ store, params, body, ctx, key }) => {
+  on("POST", /^\/api\/lab\/formulas\/([^/]+)\/revise$/, async ({ store, params, body, ctx, key, fingerprint }) => {
     assertPerm(ctx.role, "POST /formulas/:id/revise");
     const parent = (await store.read()).formulas.find((f) => f.id === params[0] || f.code === params[0]);
     if (!parent) throw new HttpError(404, "formula_not_found");
@@ -152,10 +152,10 @@ export function registerLabRoutes(on) {
       p.revisions.push({ id: f.id, code: f.code, at: now(), changes: patch });
       addAudit(db, { at: now(), actor: ctx.actor, role: ctx.role, action: "formula_revise", target: f.id, detail: { parent: p.id, changes: patch } });
       return { status: 201, body: publicFormula(f) };
-    }, { idemKey: key });
+    }, { idemKey: key, idemFingerprint: fingerprint });
   });
 
-  on("DELETE", /^\/api\/lab\/formulas\/([^/]+)$/, async ({ store, params, ctx, key }) => {
+  on("DELETE", /^\/api\/lab\/formulas\/([^/]+)$/, async ({ store, params, ctx, key, fingerprint }) => {
     assertPerm(ctx.role, "DELETE /formulas/:id");
     return store.mutate((db, { now }) => {
       const f = findFormula(db, params[0]);
@@ -165,11 +165,11 @@ export function registerLabRoutes(on) {
       db.formulas = db.formulas.filter((x) => x.id !== f.id);
       addAudit(db, { at: now(), actor: ctx.actor, role: ctx.role, action: "formula_delete", target: f.id });
       return { status: 200, body: { ok: true } };
-    }, { idemKey: key });
+    }, { idemKey: key, idemFingerprint: fingerprint });
   });
 
   // 定版：不可改、不可删。必须有一个结论性批次支持，且优胜配方正是本配方。
-  on("POST", /^\/api\/lab\/formulas\/([^/]+)\/finalize$/, async ({ store, params, body, ctx, key }) => {
+  on("POST", /^\/api\/lab\/formulas\/([^/]+)\/finalize$/, async ({ store, params, body, ctx, key, fingerprint }) => {
     assertPerm(ctx.role, "POST /formulas/:id/finalize");
     const db0 = await store.read();
     const f0 = db0.formulas.find((x) => x.id === params[0] || x.code === params[0]);
@@ -201,7 +201,7 @@ export function registerLabRoutes(on) {
       f.finalizedBatchId = support;
       addAudit(db, { at: now(), actor: ctx.actor, role: ctx.role, action: "formula_finalize", target: f.id, detail: { batchId: support } });
       return { status: 200, body: publicFormula(f) };
-    }, { idemKey: key });
+    }, { idemKey: key, idemFingerprint: fingerprint });
   });
 
   // ---------- 批次 / 试验设计 ----------
@@ -210,7 +210,7 @@ export function registerLabRoutes(on) {
     return { status: 200, body: db.batches.map(publicBatch).reverse() };
   });
 
-  on("POST", /^\/api\/lab\/batches$/, async ({ store, body, ctx, key }) => {
+  on("POST", /^\/api\/lab\/batches$/, async ({ store, body, ctx, key, fingerprint }) => {
     assertPerm(ctx.role, "POST /batches");
     const name = str(body.name, "name", { max: 60 });
     const blocks = intBetween(body.blocks ?? 3, "blocks", 1, 20);
@@ -245,7 +245,7 @@ export function registerLabRoutes(on) {
       addAudit(db, { at: now(), actor: ctx.actor, role: ctx.role, action: "batch_design", target: id,
         detail: { name, blocks, repsPerBlock, runs: runs.length, seed, levels } });
       return { status: 201, body: { ...publicBatch(batch), runs: batch.runs } };
-    }, { idemKey: key });
+    }, { idemKey: key, idemFingerprint: fingerprint });
   });
 
   on("GET", /^\/api\/lab\/batches\/([^/]+)$/, async ({ store, params }) => {
@@ -257,7 +257,7 @@ export function registerLabRoutes(on) {
 
   // ---------- 试样录入（允许并发、允许乱序、允许重复测量） ----------
   on("POST", /^\/api\/lab\/batches\/([^/]+)\/runs\/([^/]+)\/readings$/,
-    async ({ store, params, body, ctx, key }) => {
+    async ({ store, params, body, ctx, key, fingerprint }) => {
       assertPerm(ctx.role, "POST /batches/:id/readings");
       const density = num(body.density, "density", { min: 0, max: 3 });
       const colorDelta = num(body.colorDelta, "colorDelta", { min: 0, max: 100 });
@@ -286,11 +286,11 @@ export function registerLabRoutes(on) {
         addAudit(db, { at: now(), actor: ctx.actor, role: ctx.role, action: "reading_create", target: run.id,
           detail: { batchId: b.id, readingId: reading.id, seq: reading.seq } });
         return { status: 201, body: { runId: run.id, status: run.status, reading } };
-      }, { idemKey: key });
+      }, { idemKey: key, idemFingerprint: fingerprint });
     });
 
   // ---------- 复核：重复测量只留复核后的有效值；异常排除必须留痕 ----------
-  on("POST", /^\/api\/lab\/batches\/([^/]+)\/review$/, async ({ store, params, body, ctx, key }) => {
+  on("POST", /^\/api\/lab\/batches\/([^/]+)\/review$/, async ({ store, params, body, ctx, key, fingerprint }) => {
     assertPerm(ctx.role, "POST /batches/:id/review");
     const decisionsInput = body.decisions;
     if (!Array.isArray(decisionsInput) || !decisionsInput.length) throw new HttpError(400, "decisions_required");
@@ -325,7 +325,14 @@ export function registerLabRoutes(on) {
         if (d.action === "reject-reading") {
           const rd = run.readings.find((x) => x.id === d.readingId);
           if (!rd) throw new HttpError(404, "reading_not_found", { readingId: d.readingId });
-          if (rd.state !== "candidate") throw new HttpError(409, "reading_decided", { readingId: rd.id, state: rd.state });
+          if (rd.state !== "candidate") {
+            if (rd.state === "valid" && run.validReadingId === rd.id) {
+              throw new HttpError(409, "reading_is_current_valid", {
+                readingId: rd.id, reason: "驳回当前有效读数请先 reopen 退回重裁"
+              });
+            }
+            throw new HttpError(409, "reading_decided", { readingId: rd.id, state: rd.state });
+          }
           rd.state = "rejected";
           rd.decisionNote = d.reason;
           rd.decidedAt = now();
@@ -339,6 +346,19 @@ export function registerLabRoutes(on) {
           const rd = run.readings.find((x) => x.id === d.readingId);
           if (!rd) throw new HttpError(404, "reading_not_found", { readingId: d.readingId });
           if (rd.state === "rejected") throw new HttpError(409, "reading_rejected", { readingId: rd.id });
+          if (run.status === "reviewed") {
+            // 单一有效值不变量：一个试样任意时刻只能有一个有效读数。
+            // 复核后想改选另一条，必须先 /reopen 退回重裁，不允许直接覆盖。
+            if (run.validReadingId === rd.id) {
+              touched.push(run.id); // 幂等：同一条有效值重复提交，原样放行不产生新记录
+              continue;
+            }
+            throw new HttpError(409, "run_already_validated", {
+              runId: run.id,
+              currentValidReadingId: run.validReadingId,
+              reason: "改选读数请先调用 reopen 退回重裁并写明原因"
+            });
+          }
           // 其余重复读数标记为 redundant（留痕但不进统计）
           for (const x of run.readings) {
             if (x.id !== rd.id && x.state === "candidate") {
@@ -379,11 +399,11 @@ export function registerLabRoutes(on) {
         touched.push(run.id);
       }
       return { status: 200, body: { batchId: b.id, status: batchStatus(b), touched } };
-    }, { idemKey: key });
+    }, { idemKey: key, idemFingerprint: fingerprint });
   });
 
   // 退回已复核试样（复核纠错；批次关闭后禁止）
-  on("POST", /^\/api\/lab\/batches\/([^/]+)\/runs\/([^/]+)\/reopen$/, async ({ store, params, body, ctx, key }) => {
+  on("POST", /^\/api\/lab\/batches\/([^/]+)\/runs\/([^/]+)\/reopen$/, async ({ store, params, body, ctx, key, fingerprint }) => {
     assertPerm(ctx.role, "POST /batches/:id/review");
     const reason = str(body.reason || "", "reason", { min: 2, max: 200 });
     return store.mutate((db, { now }) => {
@@ -392,13 +412,25 @@ export function registerLabRoutes(on) {
       const run = b.runs.find((r) => r.id === params[1]);
       if (!run) throw new HttpError(404, "run_not_found");
       if (run.status !== "reviewed") throw new HttpError(409, "run_not_reviewed", { status: run.status });
-      const rd = run.readings.find((x) => x.id === run.validReadingId);
-      if (rd) { rd.state = "candidate"; rd.decisionNote = `退回：${reason}`; rd.decidedAt = now(); rd.decidedBy = ctx.actor; }
+      const oldValidId = run.validReadingId;
+      // 退回重裁：原有效值与当时判为重复的读数全部回到 candidate，由复核员重新裁决；
+      // 已驳回(rejected)/作废(void)的读数保持不变。整个改选经过本接口并强制写原因留痕。
+      let restored = 0;
+      for (const x of run.readings) {
+        if (x.id === oldValidId || x.state === "redundant") {
+          x.state = "candidate";
+          x.decisionNote = `退回重裁：${reason}`;
+          x.decidedAt = now();
+          x.decidedBy = ctx.actor;
+          restored += 1;
+        }
+      }
       run.validReadingId = null;
       run.status = "entered";
-      addAudit(db, { at: now(), actor: ctx.actor, role: ctx.role, action: "run_reopen", target: run.id, detail: { reason } });
-      return { status: 200, body: { runId: run.id, status: run.status } };
-    }, { idemKey: key });
+      addAudit(db, { at: now(), actor: ctx.actor, role: ctx.role, action: "run_reopen", target: run.id,
+        detail: { batchId: b.id, fromReadingId: oldValidId, restored, reason } });
+      return { status: 200, body: { runId: run.id, status: run.status, fromReadingId: oldValidId, restored } };
+    }, { idemKey: key, idemFingerprint: fingerprint });
   });
 
   // ---------- 比较分析（只读） ----------
@@ -411,7 +443,7 @@ export function registerLabRoutes(on) {
   });
 
   // ---------- 关闭批次：结论不成立则拒绝定案 ----------
-  on("POST", /^\/api\/lab\/batches\/([^/]+)\/close$/, async ({ store, params, body, ctx, key }) => {
+  on("POST", /^\/api\/lab\/batches\/([^/]+)\/close$/, async ({ store, params, body, ctx, key, fingerprint }) => {
     assertPerm(ctx.role, "POST /batches/:id/close");
     const force = body.force === true; // force 仅允许“无结论封存”，不产生优胜快照结论
     return store.mutate((db, { now }) => {
@@ -434,7 +466,7 @@ export function registerLabRoutes(on) {
       addAudit(db, { at: now(), actor: ctx.actor, role: ctx.role, action: "batch_close", target: b.id,
         detail: { status: analysis.status, winner: analysis.winner?.formulaId || null, force } });
       return { status: 200, body: publicBatch(b) };
-    }, { idemKey: key });
+    }, { idemKey: key, idemFingerprint: fingerprint });
   });
 
   // ---------- 留痕 / 总览 ----------

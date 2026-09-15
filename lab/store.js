@@ -74,12 +74,22 @@ export class LabStore {
   // 串行事务：mutator(db, helpers) 直接改 db；返回值作为 HTTP 响应体。
   // mutator 内抛 HttpError -> 不落盘、回滚并按 status 抛出；
   // 落盘抛错 -> 内存状态回滚到 before，调用方收到 500，可原样重试。
-  mutate(mutator, { idemKey } = {}) {
+  // idemFingerprint：幂等键对应请求内容的指纹。同一幂等键（已在路由层按
+  // 提交人+方法+路径隔离）若携带不同内容再次提交，拒绝为 409 冲突——
+  // 既不回放旧响应，也不落库新结果。
+  mutate(mutator, { idemKey, idemFingerprint } = {}) {
     const run = this._chain.then(async () => {
       await this.init();
       if (idemKey) {
         const hit = this._db.idem[idemKey];
-        if (hit) return { ...hit, replayed: true };
+        if (hit) {
+          if (hit.fingerprint !== undefined && hit.fingerprint !== idemFingerprint) {
+            throw new HttpError(409, "idempotency_conflict", {
+              reason: "同一幂等键已用于不同内容的请求；拒绝混用，请使用新键"
+            });
+          }
+          return { status: hit.status, body: hit.body, replayed: true };
+        }
       }
       const before = structuredClone(this._db);
       let result;
@@ -94,7 +104,7 @@ export class LabStore {
       }
       try {
         const payload = { status: (result && result.status) || 200, body: result && result.body !== undefined ? result.body : result };
-        if (idemKey) this._db.idem[idemKey] = payload; // 与业务数据同事务落盘，重启后仍可去重
+        if (idemKey) this._db.idem[idemKey] = { ...payload, fingerprint: idemFingerprint }; // 与业务数据同事务落盘，重启后仍可去重
         await this._persist(this.path, this._db);
         return { ...payload, replayed: false };
       } catch (e) {

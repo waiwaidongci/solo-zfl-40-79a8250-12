@@ -1,5 +1,5 @@
 // 质量评估与统计：组均值 / 极差 / 置信区间、主效应、二阶交互、
-// 优胜方案筛选。样本不足或区组不平衡一律 inconclusive，不得定论。
+// 优胜方案筛选。样本不足、区组不平衡、因子/交互覆盖不完整一律 inconclusive，不得定论。
 
 // 学生 t 双侧 95% 临界值（df 1..30），df>30 用正态近似
 const T95 = [
@@ -149,6 +149,47 @@ export function balanceCheck(validRuns, blocks, minReplicates) {
   };
 }
 
+// 覆盖度：主效应要求“每个配方 × 每个因子”的全部设计水平都有有效观测；
+// 二阶交互要求“每个配方 × 每对因子”的全部 2×2（或 l1×l2）单元都有有效观测。
+// 任一缺失，对应效应在统计上无法成立，不得据此给结论/建议水平。
+export function coverageCheck(validRuns, factorKeys, levels, formulas) {
+  const missingMain = [];
+  for (const fid of formulas) {
+    const rows = validRuns.filter((r) => r.formulaId === fid);
+    for (const key of factorKeys) {
+      const present = new Set(rows.map((r) => r.factors[key]));
+      const missing = (levels[key] || []).filter((lvl) => !present.has(lvl));
+      if (missing.length) missingMain.push({ formulaId: fid, factor: key, missingLevels: missing });
+    }
+  }
+  const pairs = [];
+  const missingInteractions = [];
+  for (let i = 0; i < factorKeys.length; i++) {
+    for (let j = i + 1; j < factorKeys.length; j++) {
+      const a = factorKeys[i], b = factorKeys[j];
+      pairs.push([a, b]);
+      for (const fid of formulas) {
+        const rows = validRuns.filter((r) => r.formulaId === fid);
+        const cells = new Set(rows.map((r) => `${r.factors[a]}␟${r.factors[b]}`));
+        const missingCells = [];
+        for (const la of levels[a] || []) {
+          for (const lb of levels[b] || []) {
+            if (!cells.has(`${la}␟${lb}`)) missingCells.push([la, lb]);
+          }
+        }
+        if (missingCells.length) {
+          missingInteractions.push({ formulaId: fid, factors: [a, b], missingCells });
+        }
+      }
+    }
+  }
+  return {
+    mainEffectsEstimable: missingMain.length === 0,
+    interactionsEstimable: missingInteractions.length === 0,
+    missingMain, missingInteractions, pairs
+  };
+}
+
 export function analyzeBatch(batch) {
   const factorKeys = Object.keys(batch.levels);
   const valid = validRunsOf(batch).map((r) => {
@@ -157,6 +198,8 @@ export function analyzeBatch(batch) {
   });
 
   const balance = balanceCheck(valid, batch.blocks, batch.minReplicates);
+  // 因子水平 / 交互单元覆盖：只统计“设计中存在”的水平与组合
+  const coverage = coverageCheck(valid, factorKeys, batch.levels, batch.formulaIds);
   const pendingCount = activeRunsOf(batch).filter((r) => r.status !== "reviewed").length;
   const exclusions = batch.runs.filter((r) => r.status === "excluded").length;
 
@@ -173,27 +216,32 @@ export function analyzeBatch(batch) {
     };
   }
 
-  const effects = mainEffects(valid, factorKeys);
-  const inter = interactions(valid, factorKeys);
+  // 覆盖不完整时效应不可成立：不输出会误导的数值
+  const effects = coverage.mainEffectsEstimable ? mainEffects(valid, factorKeys) : null;
+  const inter = coverage.interactionsEstimable ? interactions(valid, factorKeys) : [];
   const pooledRange = (() => {
     const s = valid.map((r) => r._score);
     return s.length ? Math.max(...s) - Math.min(...s) : 0;
   })();
-  const strongInteractions = inter
-    .filter((ix) => {
-      const [a, b] = ix.factors;
-      const ea = effects[a]?.effect || 0, eb = effects[b]?.effect || 0;
-      const smaller = Math.min(ea, eb);
-      return smaller > 0 && Math.abs(ix.did) >= 0.5 * smaller && Math.abs(ix.did) >= 0.05 * pooledRange;
-    })
-    .map((ix) => ix.factors.join("×"));
+  const strongInteractions = coverage.interactionsEstimable
+    ? inter
+        .filter((ix) => {
+          const [a, b] = ix.factors;
+          const ea = effects[a]?.effect || 0, eb = effects[b]?.effect || 0;
+          const smaller = Math.min(ea, eb);
+          return smaller > 0 && Math.abs(ix.did) >= 0.5 * smaller && Math.abs(ix.did) >= 0.05 * pooledRange;
+        })
+        .map((ix) => ix.factors.join("×"))
+    : [];
 
   // 结论闸门：任何一条不过都不得定论
   const gates = {
     enoughSamples: balance.enough,
     blockBalanced: balance.balanced,
     noMissingCells: balance.missing.length === 0,
-    everyFormulaPresent: batch.formulaIds.every((fid) => (balance.counts[fid] || 0) > 0)
+    everyFormulaPresent: batch.formulaIds.every((fid) => (balance.counts[fid] || 0) > 0),
+    mainEffectsCovered: coverage.mainEffectsEstimable,
+    interactionsCovered: coverage.interactionsEstimable
   };
   const conclusive = Object.values(gates).every(Boolean);
 
@@ -220,7 +268,10 @@ export function analyzeBatch(batch) {
     }
   }
 
-  const recommendedSetting = Object.fromEntries(factorKeys.map((k) => [k, effects[k]?.bestLevel ?? null]));
+  // 建议水平只在可定论（含全部覆盖闸门）时给出；覆盖不完整一律 null
+  const recommendedSetting = conclusive
+    ? Object.fromEntries(factorKeys.map((k) => [k, effects[k]?.bestLevel ?? null]))
+    : null;
 
   return {
     batchId: batch.id,
@@ -228,11 +279,14 @@ export function analyzeBatch(batch) {
     gates,
     reasons: [
       !gates.enoughSamples && `有效样本不足：每配方至少 ${batch.minReplicates} 次`,
-      !gates.blockBalanced && "区组不平衡：各配方在各区组的有效试样数不一致",
+      !gates.blockBalanced && "区组不平衡：同一配方在各区组的有效试样数不等，或配方间区组分布不一致",
       !gates.noMissingCells && "存在空缺的配方×区组格子",
-      !gates.everyFormulaPresent && "有配方尚无任何有效试样"
+      !gates.everyFormulaPresent && "有配方尚无任何有效试样",
+      !gates.mainEffectsCovered && "因子水平覆盖不完整：部分配方缺少某因子的设计水平，主效应无法成立",
+      !gates.interactionsCovered && "交互单元覆盖不完整：部分配方缺少因子对的 2×2 单元，交互无法成立"
     ].filter(Boolean),
     balance,
+    coverage,
     groups,
     ranking,
     winner: conclusive ? winner : null,

@@ -8,7 +8,7 @@ import { rm } from "node:fs/promises";
 import { createServer } from "../../server.js";
 import { LabStore } from "../store.js";
 import { makeRng, hashSeed, validateFactors, designRuns } from "../design.js";
-import { summarize, qualityScore, analyzeBatch, balanceCheck } from "../stats.js";
+import { summarize, qualityScore, analyzeBatch, balanceCheck, coverageCheck } from "../stats.js";
 async function startServer(store) {
   const { server } = createServer(store);
   server.listen(0, "127.0.0.1");
@@ -150,6 +150,54 @@ describe("stats 纯函数", () => {
     const bad = balanceCheck(cross, 3, 2);
     assert.equal(bad.crossFormulaUniform, false);
     assert.equal(bad.balanced, false);
+  });
+
+  const LEVELS = {
+    coating: ["薄涂", "厚涂"], exposure: ["短曝", "长曝"],
+    development: ["弱酸", "清水"], wash: ["短洗", "长洗"]
+  };
+  const FKEYS = ["coating", "exposure", "development", "wash"];
+  // 全部 16 个因子组合各 1 条（2 配方），覆盖完整
+  const fullCoveredRuns = (() => {
+    const out = [];
+    const combos = [0, 1].flatMap((c) => [0, 1].flatMap((e) => [0, 1].flatMap((d) => [0, 1].map((w) => ({ c, e, d, w })))));
+    for (const fid of ["FA", "FB"]) {
+      for (const x of combos) {
+        out.push({
+          formulaId: fid, block: 1, status: "reviewed", validReadingId: "r", _score: 1,
+          factors: { coating: LEVELS.coating[x.c], exposure: LEVELS.exposure[x.e], development: LEVELS.development[x.d], wash: LEVELS.wash[x.w] }
+        });
+      }
+    }
+    return out;
+  })();
+
+  test("覆盖：完整 2^4 设计主效应与交互单元齐全", () => {
+    const cov = coverageCheck(fullCoveredRuns, FKEYS, LEVELS, ["FA", "FB"]);
+    assert.equal(cov.mainEffectsEstimable, true);
+    assert.equal(cov.interactionsEstimable, true);
+    assert.deepEqual(cov.missingMain, []);
+    assert.deepEqual(cov.missingInteractions, []);
+    assert.equal(cov.pairs.length, 6);
+  });
+
+  test("覆盖：缺失某因子整个水平时主效应不可成立", () => {
+    const runs = fullCoveredRuns.filter((r) => r.factors.coating !== "厚涂");
+    const cov = coverageCheck(runs, FKEYS, LEVELS, ["FA", "FB"]);
+    assert.equal(cov.mainEffectsEstimable, false);
+    assert.ok(cov.missingMain.every((m) => m.factor === "coating"));
+  });
+
+  test("覆盖：交互主效应齐全但某 2×2 单元缺失时交互不可成立、主效应仍可成立", () => {
+    // 删掉 (coating=厚涂, exposure=长曝) 这一组合（两配方都删）
+    const runs = fullCoveredRuns.filter((r) =>
+      !(r.factors.coating === "厚涂" && r.factors.exposure === "长曝"));
+    const cov = coverageCheck(runs, FKEYS, LEVELS, ["FA", "FB"]);
+    assert.equal(cov.mainEffectsEstimable, true, "每个因子两水平仍都有观测");
+    assert.equal(cov.interactionsEstimable, false);
+    const pair = cov.missingInteractions.find((m) => m.factors.join(",") === "coating,exposure");
+    assert.ok(pair, "coating×exposure 2×2 缺格被检出");
+    assert.deepEqual(pair.missingCells, [["厚涂", "长曝"]]);
   });
 });
 
@@ -379,6 +427,73 @@ describe("录入 / 重复测量 / 复核", () => {
       assert.equal(run.readings[0].state, "candidate");
     } finally { await ctx.stop(); await rm(ctx.file, { force: true }); }
   });
+
+  test("单一有效值不变量：复核后直接改选被拒，必须经退回留痕后才能改选", async () => {
+    const ctx = await tempStoreServer();
+    try {
+      const [fa, fb] = await makeTwoFormulas(ctx);
+      const batch = await ctx.req("/api/lab/batches", { method: "POST", role: "technologist", body: minimalBatch([fa.id, fb.id]) });
+      const bid = batch.json.body.id;
+      const runId = batch.json.body.runs[0].id;
+      const read = (density, colorDelta) =>
+        ctx.req(`/api/lab/batches/${bid}/runs/${runId}/readings`, {
+          method: "POST", role: "recorder", body: { density, colorDelta, defect: "无" }
+        });
+      const r1 = await read(1.3, 8);
+      const r2 = await read(1.05, 20);
+      const id1 = r1.json.body.reading.id, id2 = r2.json.body.reading.id;
+
+      // 第一次复核：选 id1 为有效值，id2 变重复
+      await ctx.req(`/api/lab/batches/${bid}/review`, {
+        method: "POST", role: "reviewer",
+        body: { decisions: [{ runId, readingId: id1, action: "valid" }] }
+      });
+
+      // 直接改选另一条读数 -> 拒绝，不能留下两个有效值
+      let r = await ctx.req(`/api/lab/batches/${bid}/review`, {
+        method: "POST", role: "reviewer",
+        body: { decisions: [{ runId, readingId: id2, action: "valid" }] }
+      });
+      assert.equal(r.status, 409);
+      assert.equal(r.json.error, "run_already_validated");
+      let full = await ctx.req(`/api/lab/batches/${bid}`);
+      let run = full.json.body.runs.find((x) => x.id === runId);
+      assert.equal(run.validReadingId, id1, "有效值未被覆盖");
+      assert.equal(run.readings.filter((x) => x.state === "valid").length, 1, "任意时刻只有一个有效读数");
+      assert.equal(run.readings.find((x) => x.id === id2).state, "redundant");
+
+      // 必须先退回（强制原因 + 留痕）：id1 与 redundant 的 id2 都回到 candidate
+      const noReason = await ctx.req(`/api/lab/batches/${bid}/runs/${runId}/reopen`, {
+        method: "POST", role: "reviewer", body: { reason: "" }
+      });
+      assert.equal(noReason.status, 400);
+      const reopened = await ctx.req(`/api/lab/batches/${bid}/runs/${runId}/reopen`, {
+        method: "POST", role: "reviewer", body: { reason: "复查发现第二次测量更可信" }
+      });
+      assert.equal(reopened.status, 200);
+      assert.equal(reopened.json.body.restored, 2, "原有效值与重复读数都恢复为待裁决");
+      full = await ctx.req(`/api/lab/batches/${bid}`);
+      run = full.json.body.runs.find((x) => x.id === runId);
+      assert.equal(run.validReadingId, null);
+      assert.ok(run.readings.every((x) => x.state === "candidate"));
+
+      // 重新裁决为 id2：此时只有 id2 是有效值
+      r = await ctx.req(`/api/lab/batches/${bid}/review`, {
+        method: "POST", role: "reviewer",
+        body: { decisions: [{ runId, readingId: id2, action: "valid", reason: "改选第二次测量" }] }
+      });
+      assert.equal(r.status, 200);
+      full = await ctx.req(`/api/lab/batches/${bid}`);
+      run = full.json.body.runs.find((x) => x.id === runId);
+      assert.equal(run.validReadingId, id2);
+      assert.equal(run.readings.filter((x) => x.state === "valid").length, 1);
+      assert.equal(run.readings.find((x) => x.id === id1).state, "redundant");
+
+      // 退回动作有审计留痕
+      const audit = await ctx.req("/api/lab/audit?action=run_reopen");
+      assert.ok(audit.json.body.some((a) => a.target === runId && a.detail.fromReadingId === id1 && /更可信/.test(a.detail.reason)));
+    } finally { await ctx.stop(); await rm(ctx.file, { force: true }); }
+  });
 });
 
 describe("并发 / 幂等 / 乱序 / 落盘失败", () => {
@@ -473,16 +588,60 @@ describe("并发 / 幂等 / 乱序 / 落盘失败", () => {
       assert.ok(reading.json.body.reading.id);
       const full = await ctx.req(`/api/lab/batches/${bid}`);
       assert.equal(full.json.body.runs.find((r) => r.id === runId).readings.length, 1);
-      // 同接口同键再发（合法但数值不同的重试体）-> 回放的是首次响应，不产生第二条读数
+      // 同接口同键、相同内容的安全重试 -> 回放首次响应，不产生第二条读数
       const replay = await ctx.req(`/api/lab/batches/${bid}/runs/${runId}/readings`, {
         method: "POST", role: "recorder", key: "cross-endpoint-K",
-        body: { density: 0.9, colorDelta: 5, defect: "无" }
+        body: { density: 1.2, colorDelta: 6, defect: "无" }
       });
       assert.equal(replay.json.replayed, true);
       assert.equal(replay.json.body.reading.id, reading.json.body.reading.id);
-      assert.equal(replay.json.body.reading.density, 1.2, "回放的是首次测量值而非重试体");
+      assert.equal(replay.json.body.reading.density, 1.2);
       const afterReplay = await ctx.req(`/api/lab/batches/${bid}`);
       assert.equal(afterReplay.json.body.runs.find((r) => r.id === runId).readings.length, 1);
+    } finally { await ctx.stop(); await rm(ctx.file, { force: true }); }
+  });
+
+  test("同键不同内容明确冲突：409 且不落库新结果", async () => {
+    const ctx = await tempStoreServer();
+    try {
+      const [fa, fb] = await makeTwoFormulas(ctx);
+      const batch = await ctx.req("/api/lab/batches", { method: "POST", role: "technologist", body: minimalBatch([fa.id, fb.id]) });
+      const bid = batch.json.body.id;
+      const runId = batch.json.body.runs[0].id;
+      const path = `/api/lab/batches/${bid}/runs/${runId}/readings`;
+      const first = await ctx.req(path, {
+        method: "POST", role: "recorder", key: "content-K",
+        body: { density: 1.2, colorDelta: 6, defect: "无" }
+      });
+      assert.equal(first.status, 201);
+
+      // 不同密度/色差 -> 冲突，不回放、不新增
+      const conflict = await ctx.req(path, {
+        method: "POST", role: "recorder", key: "content-K",
+        body: { density: 1.1, colorDelta: 7, defect: "无" }
+      });
+      assert.equal(conflict.status, 409);
+      assert.equal(conflict.json.error, "idempotency_conflict");
+
+      // 不同缺陷字段同样冲突
+      const conflict2 = await ctx.req(path, {
+        method: "POST", role: "recorder", key: "content-K",
+        body: { density: 1.2, colorDelta: 6, defect: "白点" }
+      });
+      assert.equal(conflict2.status, 409);
+
+      // 相同内容仍可安全重试
+      const replay = await ctx.req(path, {
+        method: "POST", role: "recorder", key: "content-K",
+        body: { density: 1.2, colorDelta: 6, defect: "无" }
+      });
+      assert.equal(replay.status, 201);
+      assert.equal(replay.json.replayed, true);
+
+      const full = await ctx.req(`/api/lab/batches/${bid}`);
+      const run = full.json.body.runs.find((r) => r.id === runId);
+      assert.equal(run.readings.length, 1, "冲突内容未落库，只有首次一条读数");
+      assert.equal(run.readings[0].density, 1.2);
     } finally { await ctx.stop(); await rm(ctx.file, { force: true }); }
   });
 
@@ -679,6 +838,85 @@ describe("统计闸门：样本不足 / 区组不平衡不得定论", () => {
 
       const close = await ctx.req(`/api/lab/batches/${bid}/close`, { method: "POST", role: "technologist", body: { force: false } });
       assert.equal(close.status, 409, "区组不等必须拒绝封存定论");
+    } finally { await ctx.stop(); await rm(ctx.file, { force: true }); }
+  });
+
+  test("因子水平/交互单元覆盖不完整（区组却平衡）不得定论、不建议水平", async () => {
+    const ctx = await tempStoreServer();
+    try {
+      const [fa, fb] = await makeTwoFormulas(ctx);
+      const batch = await ctx.req("/api/lab/batches", {
+        method: "POST", role: "technologist",
+        body: minimalBatch([fa.id, fb.id], { blocks: 2, repsPerBlock: 1, minReplicates: 2 })
+      });
+      const bid = batch.json.body.id;
+      const runs = batch.json.body.runs;
+      // 每个配方在每个区组只取同一条因子组合（两个区组取同一种组合，保证区组平衡），
+      // 16 个设计组合里只覆盖 1 个：主效应与交互都无法成立。
+      const decisions = [];
+      for (const fid of [fa.id, fb.id]) {
+        for (const block of [1, 2]) {
+          const target = runs.find((r) => r.formulaId === fid && r.block === block);
+          const rd = await ctx.req(`/api/lab/batches/${bid}/runs/${target.id}/readings`, {
+            method: "POST", role: "recorder",
+            body: fid === fa.id ? { density: 1.4, colorDelta: 10, defect: "无" } : { density: 0.8, colorDelta: 30, defect: "白点" }
+          });
+          decisions.push({ runId: target.id, readingId: rd.json.body.reading.id, action: "valid" });
+        }
+      }
+      await ctx.req(`/api/lab/batches/${bid}/review`, { method: "POST", role: "reviewer", body: { decisions } });
+      const a = await ctx.req(`/api/lab/batches/${bid}/analysis`);
+      const an = a.json.body;
+      assert.equal(an.balance.balanced, true, "每配方每区组各 1 条，区组本身平衡");
+      assert.equal(an.balance.enough, true, "每配方 2 条达到最小重复");
+      assert.equal(an.gates.mainEffectsCovered, false);
+      assert.equal(an.gates.interactionsCovered, false);
+      assert.equal(an.status, "inconclusive");
+      assert.equal(an.winner, null, "覆盖不足不得出优胜");
+      assert.equal(an.recommendedSetting, null, "覆盖不足不得建议工艺水平");
+      assert.equal(an.effects, null, "不输出无法成立的主效应数值");
+      assert.deepEqual(an.interactions, [], "不输出无法成立的交互数值");
+      assert.ok(an.reasons.some((r) => /覆盖不完整/.test(r)), "原因中说明覆盖问题");
+      assert.ok(an.coverage.missingMain.length > 0);
+
+      const close = await ctx.req(`/api/lab/batches/${bid}/close`, { method: "POST", role: "technologist", body: { force: false } });
+      assert.equal(close.status, 409, "覆盖不完整拒绝封存定论");
+
+      // 输家/赢家都不能借此定版（无结论）
+      const fin = await ctx.req(`/api/lab/formulas/${fa.id}/finalize`, { method: "POST", role: "technologist", body: { batchId: bid } });
+      assert.equal(fin.status, 409);
+    } finally { await ctx.stop(); await rm(ctx.file, { force: true }); }
+  });
+
+  test("仅交互单元缺失：主效应成立但结论仍受交互闸门拦截", async () => {
+    const ctx = await tempStoreServer();
+    try {
+      const [fa, fb] = await makeTwoFormulas(ctx);
+      // 2 区组、4 因子的完整 2^4 设计：要保证主效应覆盖，用每配方两区组的“互补半部分”拼不出全部 16 组合。
+      // 改为 1 区组、repsPerBlock=2（每组合重复2次）-> 32 条/配方；剔除一对缺失的交互单元且保持区组平衡。
+      const batch = await ctx.req("/api/lab/batches", {
+        method: "POST", role: "technologist",
+        body: minimalBatch([fa.id, fb.id], { blocks: 1, repsPerBlock: 2, minReplicates: 2 })
+      });
+      const bid = batch.json.body.id;
+      const runs = batch.json.body.runs;
+      const decisions = [];
+      // 缺 (coating=厚涂, exposure=长曝) 单元的全部重复（两配方都缺）-> 交互不齐，但每个因子两水平仍都出现
+      const excluded = [];
+      for (const r of runs) {
+        if (r.factors.coating === "厚涂" && r.factors.exposure === "长曝") { excluded.push(r.id); continue; }
+        const rd = await ctx.req(`/api/lab/batches/${bid}/runs/${r.id}/readings`, {
+          method: "POST", role: "recorder", body: { density: 1.2, colorDelta: 8, defect: "无" }
+        });
+        decisions.push({ runId: r.id, readingId: rd.json.body.reading.id, action: "valid" });
+      }
+      await ctx.req(`/api/lab/batches/${bid}/review`, { method: "POST", role: "reviewer", body: { decisions } });
+      const an = (await ctx.req(`/api/lab/batches/${bid}/analysis`)).json.body;
+      assert.ok(excluded.length >= 2, "确认确有交互单元被排除");
+      assert.equal(an.gates.mainEffectsCovered, true, "每个因子两水平仍有观测");
+      assert.equal(an.gates.interactionsCovered, false, "coating×exposure 缺格");
+      assert.equal(an.status, "inconclusive");
+      assert.equal(an.winner, null);
     } finally { await ctx.stop(); await rm(ctx.file, { force: true }); }
   });
 });

@@ -446,9 +446,10 @@ async function runCompare() {
     gateRow(a.gates.noMissingCells, "无空缺区组格子") +
     gateRow(a.gates.everyFormulaPresent, "每配方有有效数据") +
     gateRow(a.gates.mainEffectsCovered, "区组内因子水平覆盖完整（主效应可成立）") +
-    gateRow(a.gates.interactionsCovered, "区组内交互单元覆盖完整（二阶交互可成立）") + "</div>";
+    gateRow(a.gates.interactionsCovered, "区组内交互单元覆盖完整（二阶交互可成立）") +
+    gateRow(a.gates.equalReplication, "处理重复数一致（同配方同区组各组合等重复）") + "</div>";
   if (a.status !== "conclusive") {
-    html += '<p class="gate-bad">结论：样本不足、区组不平衡或因子/交互覆盖不完整，不得定论。原因：' + esc(a.reasons.join("；")) + "</p>";
+    html += '<p class="gate-bad">结论：样本不足、区组不平衡、覆盖不完整或处理重复数不一致，不得定论。原因：' + esc(a.reasons.join("；")) + "</p>";
   } else {
     html += '<p class="gate-ok">结论：可以定论。优胜：' + esc(fName(a.winner.formulaId)) + "（均分 " + a.winner.mean + "，n=" + a.winner.n + "，95%CI ±" + a.winner.ci + "）</p>";
     if (Array.isArray(a.ciOverlap) && a.ciOverlap.some((x) => x.overlap)) html += '<p><span class="pill bad">置信区间与次优重叠：' +

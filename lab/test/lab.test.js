@@ -8,7 +8,7 @@ import { rm } from "node:fs/promises";
 import { createServer } from "../../server.js";
 import { LabStore } from "../store.js";
 import { makeRng, hashSeed, validateFactors, designRuns } from "../design.js";
-import { summarize, qualityScore, analyzeBatch, balanceCheck, coverageCheck } from "../stats.js";
+import { summarize, qualityScore, analyzeBatch, balanceCheck, coverageCheck, replicationCheck } from "../stats.js";
 async function startServer(store) {
   const { server } = createServer(store);
   server.listen(0, "127.0.0.1");
@@ -250,6 +250,55 @@ describe("stats 纯函数", () => {
     assert.equal(cov.interactionsEstimable, true);
     assert.deepEqual(cov.missingMain, []);
     assert.deepEqual(cov.missingInteractions, []);
+  });
+
+  // 每个配方×区组下 16 组合各一条的完整底表；可指定额外重复的组合签名
+  function repBase(extraComboSig = null) {
+    const runs = [];
+    const combos = [0, 1].flatMap((c) => [0, 1].flatMap((e) => [0, 1].flatMap((d) => [0, 1].map((w) => ({ c, e, d, w })))));
+    const factorsOf = (x) => ({
+      coating: LEVELS.coating[x.c], exposure: LEVELS.exposure[x.e],
+      development: LEVELS.development[x.d], wash: LEVELS.wash[x.w]
+    });
+    for (const fid of ["FA", "FB"]) {
+      for (const block of [1, 2]) {
+        for (const x of combos) {
+          runs.push({ formulaId: fid, block, status: "reviewed", validReadingId: "r", _score: 1, factors: factorsOf(x) });
+        }
+        if (extraComboSig) {
+          const x = combos.find((q) => [LEVELS.coating[q.c], LEVELS.exposure[q.e], LEVELS.development[q.d], LEVELS.wash[q.w]].join("␟") === extraComboSig);
+          runs.push({ formulaId: fid, block, status: "reviewed", validReadingId: "r2", _score: 1, factors: factorsOf(x) });
+        }
+      }
+    }
+    return runs;
+  }
+
+  test("等重复：完整设计每组合等次数 -> uniform", () => {
+    const rep = replicationCheck(repBase(), FKEYS, LEVELS, ["FA", "FB"], 2);
+    assert.equal(rep.uniform, true);
+    assert.deepEqual(rep.uneven, []);
+  });
+
+  test("等重复：repsPerBlock=2 每组合各 2 条 -> uniform", () => {
+    const two = [...repBase(), ...repBase()].map((r, i) => ({ ...r, validReadingId: "r" + i }));
+    const rep = replicationCheck(two, FKEYS, LEVELS, ["FA", "FB"], 2);
+    assert.equal(rep.uniform, true);
+  });
+
+  test("等重复：单/多次组合混合 -> 不 uniform（即使覆盖完整、两配方区组总量一致）", () => {
+    const sig = ["薄涂", "短曝", "弱酸", "短洗"].join("␟");
+    const runs = repBase(sig);
+    // 覆盖仍完整
+    assert.equal(coverageCheck(runs, FKEYS, LEVELS, ["FA", "FB"], 2).mainEffectsEstimable, true);
+    const rep = replicationCheck(runs, FKEYS, LEVELS, ["FA", "FB"], 2);
+    assert.equal(rep.uniform, false);
+    assert.equal(rep.uneven.length, 4, "2 配方 × 2 区组都被点名");
+    for (const u of rep.uneven) {
+      assert.equal(u.min, 1);
+      assert.equal(u.max, 2);
+      assert.deepEqual(u.overRepresented, [sig]);
+    }
   });
 });
 
@@ -1047,6 +1096,88 @@ describe("统计闸门：样本不足 / 区组不平衡不得定论", () => {
       assert.equal(an.status, "conclusive");
       assert.equal(an.winner.formulaId, fa.id);
       assert.ok(an.recommendedSetting && an.recommendedSetting.wash);
+    } finally { await ctx.stop(); await rm(ctx.file, { force: true }); }
+  });
+
+  test("处理重复数不一致（单/多次组合混合）不得定论；恢复等重复后可定论", async () => {
+    const ctx = await tempStoreServer();
+    try {
+      const [fa, fb] = await makeTwoFormulas(ctx);
+      // 1 区组 × 每组合重复 2 次：每个配方 16 组合 × 2 = 32 条
+      const batch = await ctx.req("/api/lab/batches", {
+        method: "POST", role: "technologist",
+        body: minimalBatch([fa.id, fb.id], { blocks: 1, repsPerBlock: 2, minReplicates: 2 })
+      });
+      const bid = batch.json.body.id;
+
+      // 按 (配方, 因子组合) 分组；runs 顺序已在区组内洗牌，用内容分组而非下标
+      const groups = new Map();
+      for (const r of batch.json.body.runs) {
+        const sig = ["coating", "exposure", "development", "wash"].map((k) => r.factors[k]).join("|");
+        const key = r.formulaId + "|" + sig;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(r);
+      }
+      assert.equal(groups.size, 32, "2 配方 × 16 组合");
+      const firstComboSig = ["coating", "exposure", "development", "wash"].map((k) =>
+        batch.json.body.runs[0].factors[k]).join("|");
+      const faOther = [...groups.keys()].filter((k) => k.startsWith(fa.id + "|") && !k.endsWith("|" + firstComboSig));
+      const fbOther = [...groups.keys()].filter((k) => k.startsWith(fb.id + "|") && !k.endsWith("|" + firstComboSig));
+      const faTarget = groups.get(fa.id + "|" + firstComboSig);
+      const fbTarget = groups.get(fb.id + "|" + firstComboSig);
+
+      const validate = async (run, fid) => {
+        const rd = await ctx.req(`/api/lab/batches/${bid}/runs/${run.id}/readings`, {
+          method: "POST", role: "recorder",
+          body: fid === fa.id ? { density: 1.4, colorDelta: 10, defect: "无" } : { density: 0.9, colorDelta: 26, defect: "白点" }
+        });
+        return { runId: run.id, readingId: rd.json.body.reading.id, action: "valid" };
+      };
+
+      // —— 阶段1：两配方都把“目标组合”复核 2 次，其余 15 组合各 1 次 ——
+      // 每配方有效总数同为 17、所有组合都出现：区组总量与覆盖闸门都过，仅等重复不过。
+      const dec1 = [];
+      dec1.push(...await Promise.all(faTarget.map((r) => validate(r, fa.id))));
+      dec1.push(...await Promise.all(fbTarget.map((r) => validate(r, fb.id))));
+      dec1.push(...await Promise.all(faOther.map((k) => validate(groups.get(k)[0], fa.id))));
+      dec1.push(...await Promise.all(fbOther.map((k) => validate(groups.get(k)[0], fb.id))));
+      await ctx.req(`/api/lab/batches/${bid}/review`, { method: "POST", role: "reviewer", body: { decisions: dec1 } });
+
+      let an = (await ctx.req(`/api/lab/batches/${bid}/analysis`)).json.body;
+      assert.equal(an.balance.balanced, true, "两配方区组总数同为 17，区组矩阵仍均衡");
+      assert.equal(an.gates.mainEffectsCovered, true, "每个组合都有观测，覆盖完整");
+      assert.equal(an.gates.interactionsCovered, true);
+      assert.equal(an.gates.equalReplication, false, "目标组合 2 次、其余 1 次：等重复闸门失败");
+      assert.equal(an.replication.uneven.length, 2, "两个配方的区组1都被点名");
+      for (const u of an.replication.uneven) {
+        assert.equal(u.block, 1);
+        assert.equal(u.min, 1);
+        assert.equal(u.max, 2);
+        assert.equal(u.overRepresented.length, 1);
+      }
+      assert.equal(an.status, "inconclusive");
+      assert.equal(an.winner, null, "重复加权时不得给优胜配方");
+      assert.equal(an.effects, null, "不得输出受加权影响的主效应值");
+      assert.equal(an.interactions.length, 0);
+      assert.equal(an.recommendedSetting, null, "不得给建议工艺");
+      const close1 = await ctx.req(`/api/lab/batches/${bid}/close`, { method: "POST", role: "technologist", body: { force: false } });
+      assert.equal(close1.status, 409, "等重复未恢复前拒绝封存定论");
+
+      // —— 阶段2：恢复等重复——把两配方其余 15 组合的第二次也录入并复核 ——
+      const dec2 = [];
+      dec2.push(...await Promise.all(faOther.map((k) => validate(groups.get(k)[1], fa.id))));
+      dec2.push(...await Promise.all(fbOther.map((k) => validate(groups.get(k)[1], fb.id))));
+      await ctx.req(`/api/lab/batches/${bid}/review`, { method: "POST", role: "reviewer", body: { decisions: dec2 } });
+
+      an = (await ctx.req(`/api/lab/batches/${bid}/analysis`)).json.body;
+      assert.equal(an.gates.equalReplication, true, "恢复每组合等 2 次");
+      assert.deepEqual(an.replication.uneven, []);
+      assert.equal(an.status, "conclusive");
+      assert.equal(an.winner.formulaId, fa.id);
+      assert.ok(an.effects && an.effects.coating.effect !== null, "效应值恢复输出");
+      assert.ok(an.recommendedSetting && an.recommendedSetting.wash);
+      const close2 = await ctx.req(`/api/lab/batches/${bid}/close`, { method: "POST", role: "technologist", body: { force: false } });
+      assert.equal(close2.status, 200, "等重复恢复后允许封存定论");
     } finally { await ctx.stop(); await rm(ctx.file, { force: true }); }
   });
 });
